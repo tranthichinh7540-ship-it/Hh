@@ -6,180 +6,199 @@ local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local camera = workspace.CurrentCamera
 
--- Cấu hình
+-- Cấu hình phím & thông số ShiftLock PC
 local SHIFT_LOCK_KEY = Enum.KeyCode.LeftShift
 local ALT_SHIFT_LOCK_KEY = Enum.KeyCode.RightShift
 local TOGGLE_SCRIPT_KEY = Enum.KeyCode.F3
 
-local CROSSHAIR_OFFSET_Y = -60 -- Dịch lên trên so với tâm màn hình (pixel)
-local HIDE_CURSOR_ON_CROSSHAIR = true
-local HIDE_CURSOR_ON_SHIFTLOCK = true
+local SHOULDER_OFFSET = Vector3.new(1.75, 0, 0) -- Lệch vai phải giống ShiftLock PC (đặt 0,0,0 nếu muốn chính giữa)
+local USE_CUSTOM_CROSSHAIR = true
+local CROSSHAIR_TEXT = "+" -- Có thể đổi thành "•" hoặc "x"
+local CROSSHAIR_SIZE = 26
+local CROSSHAIR_COLOR = Color3.fromRGB(255, 255, 255)
 
 local sensX = 0.0045
 local sensY = 0.0045
 local maxStepDelta = 65
+local maxPitch = math.rad(82)
+local turnAlpha = 0.65
 
 local scriptEnabled = true
-local holdingRight = false
 local shiftLockActive = false
+local yaw = 0
+local pitch = 0.15
 local pendingDelta = Vector2.zero
 
-local savedMouseIcon = UserInputService.MouseIconEnabled
-local savedMouseBehavior = UserInputService.MouseBehavior
-
-local BIND_NAME = "AndroidShiftLockAndRightCamFix"
+local savedBehavior = UserInputService.MouseBehavior
+local savedIconEnabled = UserInputService.MouseIconEnabled
+local BIND_NAME = "PCStyleShiftLockWithCrosshair"
 
 workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
 	camera = workspace.CurrentCamera
 end)
 
--- UI Crosshair khi giữ chuột phải
+-- ScreenGui chứa Crosshair ở chính giữa màn hình
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "RightClickCrosshairGui"
+screenGui.Name = "ShiftLockCrosshairGui"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
 screenGui.DisplayOrder = 1000
 screenGui.Parent = playerGui
 
 local crosshairLabel = Instance.new("TextLabel")
-crosshairLabel.Name = "Crosshair"
+crosshairLabel.Name = "CenterCrosshair"
 crosshairLabel.BackgroundTransparency = 1
-crosshairLabel.Size = UDim2.fromOffset(28, 28)
+crosshairLabel.Size = UDim2.fromOffset(CROSSHAIR_SIZE, CROSSHAIR_SIZE)
+crosshairLabel.Position = UDim2.fromScale(0.5, 0.5)
 crosshairLabel.AnchorPoint = Vector2.new(0.5, 0.5)
 crosshairLabel.Font = Enum.Font.GothamBold
-crosshairLabel.Text = "+"
-crosshairLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-crosshairLabel.TextStrokeTransparency = 0.25
-crosshairLabel.TextSize = 24
+crosshairLabel.Text = CROSSHAIR_TEXT
+crosshairLabel.TextColor3 = CROSSHAIR_COLOR
+crosshairLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+crosshairLabel.TextStrokeTransparency = 0.2
+crosshairLabel.TextSize = CROSSHAIR_SIZE - 4
 crosshairLabel.Visible = false
 crosshairLabel.ZIndex = 100
 crosshairLabel.Parent = screenGui
 
-local function updateCrosshairPosition()
-	local vp = camera and camera.ViewportSize or Vector2.new(1280, 720)
-	local centerX = vp.X * 0.5
-	local centerY = (vp.Y * 0.5) + CROSSHAIR_OFFSET_Y
-	crosshairLabel.Position = UDim2.fromOffset(centerX, centerY)
+-- Lấy RootPart / Humanoid của nhân vật hiện tại hoặc Morph
+local function getControlledRootAndHumanoid(): (BasePart?, Humanoid?)
+	if camera and camera.CameraSubject then
+		local subj = camera.CameraSubject
+		if subj:IsA("Humanoid") then
+			local model = subj.Parent
+			local root = subj.RootPart
+				or (model and model:IsA("Model") and model.PrimaryPart)
+				or (model and model:FindFirstChild("HumanoidRootPart") :: BasePart?)
+			return root, subj
+		elseif subj:IsA("BasePart") then
+			local model = subj:FindFirstAncestorOfClass("Model")
+			local hum = model and model:FindFirstChildOfClass("Humanoid")
+			local root = (hum and hum.RootPart) or (model and model.PrimaryPart) or subj
+			return root, hum
+		end
+	end
+
+	local char = player.Character
+	if char then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local root = (hum and hum.RootPart)
+			or char.PrimaryPart
+			or (char:FindFirstChild("HumanoidRootPart") :: BasePart?)
+		return root, hum
+	end
+
+	return nil, nil
 end
 
-local function refreshMouseState()
-	if not scriptEnabled then
-		crosshairLabel.Visible = false
-		UserInputService.MouseIconEnabled = savedMouseIcon
-		UserInputService.MouseBehavior = savedMouseBehavior
+local function syncAnglesFromCamera()
+	if not camera then
+		return
+	end
+	local look = camera.CFrame.LookVector
+	yaw = math.atan2(-look.X, -look.Z)
+	pitch = math.clamp(math.asin(math.clamp(look.Y, -1, 1)), -maxPitch, maxPitch)
+end
+
+local function applyShiftLockState()
+	local active = scriptEnabled and shiftLockActive
+	crosshairLabel.Visible = active and USE_CUSTOM_CROSSHAIR
+
+	if not active then
+		UserInputService.MouseBehavior = savedBehavior
+		UserInputService.MouseIconEnabled = savedIconEnabled
 		return
 	end
 
-	if shiftLockActive then
-		crosshairLabel.Visible = false
-		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-		UserInputService.MouseIconEnabled = not HIDE_CURSOR_ON_SHIFTLOCK
-	elseif holdingRight then
-		updateCrosshairPosition()
-		crosshairLabel.Visible = true
-		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
-		UserInputService.MouseIconEnabled = not HIDE_CURSOR_ON_CROSSHAIR
-	else
-		crosshairLabel.Visible = false
-		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-		UserInputService.MouseIconEnabled = true
-	end
+	UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	UserInputService.MouseIconEnabled = false
 end
 
 local function setShiftLock(state: boolean)
 	shiftLockActive = state
-	if shiftLockActive then
-		holdingRight = false
-	end
 	pendingDelta = Vector2.zero
-	refreshMouseState()
-end
-
-local function alignCharacterToCameraYaw()
-	local char = player.Character
-	if not char or not camera then
-		return
+	if shiftLockActive then
+		syncAnglesFromCamera()
 	end
-	local hrp = char:FindFirstChild("HumanoidRootPart") :: BasePart?
-	local humanoid = char:FindFirstChildOfClass("Humanoid")
-	if not hrp or not humanoid or humanoid.Sit or humanoid.Health <= 0 then
-		return
-	end
-
-	local look = camera.CFrame.LookVector
-	local flatLook = Vector3.new(look.X, 0, look.Z)
-	if flatLook.Magnitude > 1e-4 then
-		flatLook = flatLook.Unit
-		local targetCF = CFrame.lookAt(hrp.Position, hrp.Position + flatLook)
-		hrp.CFrame = hrp.CFrame:Lerp(targetCF, 0.5)
-	end
+	applyShiftLockState()
 end
 
 local function consumeDelta()
 	local d = pendingDelta
 	pendingDelta = Vector2.zero
-
 	if d.Magnitude == 0 then
-		local gm = UserInputService:GetMouseDelta()
-		d = gm
+		d = UserInputService:GetMouseDelta()
 	end
-
 	local dx = math.clamp(d.X, -maxStepDelta, maxStepDelta)
 	local dy = math.clamp(d.Y, -maxStepDelta, maxStepDelta)
 	return dx, dy
 end
 
-local function onRenderStep()
-	if not scriptEnabled or not camera then
+local function rotateControlledEntity()
+	local root, hum = getControlledRootAndHumanoid()
+	if not root then
+		return
+	end
+	if hum and (hum.Sit or hum.Health <= 0) then
+		return
+	end
+	if root.Anchored then
 		return
 	end
 
-	local activeMode = shiftLockActive or holdingRight
-	if not activeMode then
-		pendingDelta = Vector2.zero
-		return
-	end
-
-	if shiftLockActive then
-		if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
-			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-		end
-	elseif holdingRight then
-		updateCrosshairPosition()
-		if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCurrentPosition then
-			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
-		end
-	end
-
-	local dx, dy = consumeDelta()
-
-	if (dx ~= 0 or dy ~= 0) and (camera.CameraType == Enum.CameraType.Custom or camera.CameraType == Enum.CameraType.Scriptable) then
-		local focusPos = camera.Focus.Position
-		local offset = camera.CFrame.Position - focusPos
-
-		local yawCF = CFrame.fromAxisAngle(Vector3.yAxis, -dx * sensX)
-		local rotatedOffset = yawCF * offset
-
-		local rightAxis = yawCF * camera.CFrame.RightVector
-		local pitchCF = CFrame.fromAxisAngle(rightAxis, -dy * sensY)
-		local finalOffset = pitchCF * rotatedOffset
-
-		local lookDir = (-finalOffset).Unit
-		if math.abs(lookDir.Y) < 0.985 then
-			camera.CFrame = CFrame.lookAt(focusPos + finalOffset, focusPos)
-		end
-	end
-
-	if shiftLockActive then
-		alignCharacterToCameraYaw()
+	local flatLook = Vector3.new(-math.sin(yaw), 0, -math.cos(yaw))
+	if flatLook.Magnitude > 1e-4 then
+		flatLook = flatLook.Unit
+		local targetCF = CFrame.lookAt(root.Position, root.Position + flatLook)
+		root.CFrame = root.CFrame:Lerp(targetCF, turnAlpha)
 	end
 end
 
-UserInputService.InputChanged:Connect(function(input, _gameProcessed)
-	if not scriptEnabled then
+local function onRenderStep()
+	if not scriptEnabled or not shiftLockActive or not camera then
 		return
 	end
-	if input.UserInputType == Enum.UserInputType.MouseMovement and (shiftLockActive or holdingRight) then
+
+	if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	end
+	if UserInputService.MouseIconEnabled then
+		UserInputService.MouseIconEnabled = false
+	end
+	if USE_CUSTOM_CROSSHAIR and not crosshairLabel.Visible then
+		crosshairLabel.Visible = true
+	end
+
+	local dx, dy = consumeDelta()
+	yaw -= dx * sensX
+	pitch = math.clamp(pitch - dy * sensY, -maxPitch, maxPitch)
+
+	if camera.CameraType == Enum.CameraType.Custom or camera.CameraType == Enum.CameraType.Scriptable then
+		local root, _ = getControlledRootAndHumanoid()
+		local baseFocus = root and (root.Position + Vector3.new(0, 1.5, 0)) or camera.Focus.Position
+
+		local dist = (camera.CFrame.Position - camera.Focus.Position).Magnitude
+		if dist < 2 then
+			dist = 10
+		end
+
+		local rotCF = CFrame.fromOrientation(pitch, yaw, 0)
+		local worldShoulderOffset = (rotCF.RightVector * SHOULDER_OFFSET.X) + (Vector3.yAxis * SHOULDER_OFFSET.Y)
+		local focusWithShoulder = baseFocus + worldShoulderOffset
+
+		local lookDir = rotCF.LookVector
+		local camPos = focusWithShoulder - (lookDir * dist)
+		camera.CFrame = CFrame.lookAt(camPos, camPos + lookDir)
+	end
+
+	rotateControlledEntity()
+end
+
+UserInputService.InputChanged:Connect(function(input, _gameProcessed)
+	if not scriptEnabled or not shiftLockActive then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
 		local d = input.Delta
 		if d and (d.X ~= 0 or d.Y ~= 0) then
 			pendingDelta += Vector2.new(d.X, d.Y)
@@ -191,38 +210,19 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if input.KeyCode == TOGGLE_SCRIPT_KEY then
 		scriptEnabled = not scriptEnabled
 		if not scriptEnabled then
-			holdingRight = false
 			shiftLockActive = false
 			pendingDelta = Vector2.zero
 		end
-		refreshMouseState()
+		applyShiftLockState()
 		return
 	end
 
-	if not scriptEnabled then
+	if not scriptEnabled or gameProcessed then
 		return
 	end
 
 	if input.KeyCode == SHIFT_LOCK_KEY or input.KeyCode == ALT_SHIFT_LOCK_KEY then
-		if not gameProcessed then
-			setShiftLock(not shiftLockActive)
-		end
-	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
-		if not shiftLockActive and not gameProcessed then
-			holdingRight = true
-			pendingDelta = Vector2.zero
-			refreshMouseState()
-		end
-	end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton2 then
-		if holdingRight then
-			holdingRight = false
-			pendingDelta = Vector2.zero
-			refreshMouseState()
-		end
+		setShiftLock(not shiftLockActive)
 	end
 end)
 
@@ -231,4 +231,4 @@ pcall(function()
 end)
 RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 10, onRenderStep)
 
-refreshMouseState()
+applyShiftLockState()
