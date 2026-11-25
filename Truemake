@@ -6,28 +6,21 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 local state = {
-	followTarget = false,
-	burstClick = false,
+	clickAll = false,
 	bigHitbox = false,
-	hitboxScale = 22,
-	followOffset = Vector3.new(0, 0, 3.5),
-	selectedTarget = nil,
-	skippedTargets = {}, -- [Instance] = os.clock()
-	skipCooldown = 0.5,  -- Bỏ qua sau 0.5s nếu không click/tiến triển được
-	lastProgressClock = 0,
-	lastHealthOrState = nil,
+	noCooldown = false,
+	godMode = false,
+	bypassPending = false,
+	hitboxScale = 24,
+	skipCooldown = 0.5,
+	skippedInstances = {},
+	lastStateSig = {},
+	lastChangeClock = {},
+	pendingHooks = {}, -- [Instance] = true
 }
 
 local expandedParts = {}
-
-local function getCharacter()
-	return LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-end
-
-local function getCharacterRoot()
-	local char = getCharacter()
-	return char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart")
-end
+local savedCooldowns = {} -- [Instance] = { prop = value }
 
 local function getSpawnedFolder()
 	return Workspace:FindFirstChild("SpawnedSans")
@@ -47,24 +40,179 @@ local function getTargetPart(obj)
 	return obj:FindFirstChildWhichIsA("BasePart", true)
 end
 
-local function isTargetClickable(obj)
+-- Skill No CD: quét và xóa/đưa về 0 các giá trị/thuộc tính/attribute liên quan cooldown
+local function applyNoCooldown()
+	if not state.noCooldown then return end
+
+	local containers = {
+		LocalPlayer,
+		LocalPlayer.Character,
+		LocalPlayer:FindFirstChild("Backpack"),
+		PlayerGui,
+	}
+
+	local function cleanContainer(root)
+		if not root then return end
+		for _, inst in ipairs(root:GetDescendants()) do
+			local lname = string.lower(inst.Name)
+			if string.find(lname, "cooldown") or string.find(lname, "cd") or string.find(lname, "debounce") then
+				if inst:IsA("NumberValue") or inst:IsA("IntValue") then
+					if savedCooldowns[inst] == nil then
+						savedCooldowns[inst] = inst.Value
+					end
+					inst.Value = 0
+				elseif inst:IsA("BoolValue") then
+					if savedCooldowns[inst] == nil then
+						savedCooldowns[inst] = inst.Value
+					end
+					inst.Value = false
+				end
+			end
+
+			for attrName, attrVal in pairs(inst:GetAttributes()) do
+				local lattr = string.lower(attrName)
+				if (string.find(lattr, "cooldown") or string.find(lattr, "cd") or string.find(lattr, "debounce")) and typeof(attrVal) == "number" then
+					if savedCooldowns[inst] == nil then
+						savedCooldowns[inst] = {}
+					end
+					if savedCooldowns[inst][attrName] == nil then
+						savedCooldowns[inst][attrName] = attrVal
+					end
+					inst:SetAttribute(attrName, 0)
+				end
+			end
+		end
+	end
+
+	for _, c in ipairs(containers) do
+		pcall(cleanContainer, c)
+	end
+end
+
+local function restoreCooldowns()
+	for inst, oldVal in pairs(savedCooldowns) do
+		if inst and inst.Parent then
+			pcall(function()
+				if typeof(oldVal) == "table" then
+					for attrName, val in pairs(oldVal) do
+						inst:SetAttribute(attrName, val)
+					end
+				elseif inst:IsA("NumberValue") or inst:IsA("IntValue") or inst:IsA("BoolValue") then
+					inst.Value = oldVal
+				end
+			end)
+		end
+		savedCooldowns[inst] = nil
+	end
+end
+
+-- Godmode client-side: giữ máu, chặn trạng thái chết/ragdoll/ngã
+local function applyGodMode()
+	if not state.godMode then return end
+	local char = LocalPlayer.Character
+	if not char then return end
+
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		pcall(function()
+			if hum.MaxHealth > 0 and hum.Health < hum.MaxHealth then
+				hum.Health = hum.MaxHealth
+			end
+			hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+			hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+		end)
+	end
+end
+
+-- Bypass ClickPending: reset/tắt trạng thái đang chờ click hoặc mở khóa ngay khi bị kẹt pending
+local function bypassClickPending()
+	if not state.bypassPending then return end
+
+	local function patchPending(inst)
+		if not inst or not inst.Parent then return end
+		local lname = string.lower(inst.Name)
+		if string.find(lname, "clickpending") or string.find(lname, "pending") or string.find(lname, "isclicking") or string.find(lname, "debounce") then
+			if inst:IsA("BoolValue") then
+				inst.Value = false
+			elseif inst:IsA("NumberValue") or inst:IsA("IntValue") then
+				inst.Value = 0
+			end
+		end
+
+		for attrName, attrVal in pairs(inst:GetAttributes()) do
+			local lattr = string.lower(attrName)
+			if string.find(lattr, "pending") or string.find(lattr, "clicking") then
+				if typeof(attrVal) == "boolean" then
+					inst:SetAttribute(attrName, false)
+				elseif typeof(attrVal) == "number" then
+					inst:SetAttribute(attrName, 0)
+				end
+			end
+		end
+
+		if not state.pendingHooks[inst] then
+			state.pendingHooks[inst] = true
+			if inst:IsA("BoolValue") then
+				inst:GetPropertyChangedSignal("Value"):Connect(function()
+					if state.bypassPending and inst.Value == true then
+						inst.Value = false
+					end
+				end)
+			elseif inst:IsA("NumberValue") or inst:IsA("IntValue") then
+				inst:GetPropertyChangedSignal("Value"):Connect(function()
+					if state.bypassPending and inst.Value ~= 0 then
+						inst.Value = 0
+					end
+				end)
+			end
+		end
+	end
+
+	local roots = { LocalPlayer, LocalPlayer.Character, PlayerGui, getSpawnedFolder() }
+	for _, r in ipairs(roots) do
+		if r then
+			for _, d in ipairs(r:GetDescendants()) do
+				pcall(patchPending, d)
+			end
+		end
+	end
+end
+
+local function cleanupSkips()
+	local now = os.clock()
+	for inst, untilClock in pairs(state.skippedInstances) do
+		if not inst or not inst.Parent or now >= untilClock then
+			state.skippedInstances[inst] = nil
+		end
+	end
+	for inst in pairs(state.lastStateSig) do
+		if not inst or not inst.Parent then
+			state.lastStateSig[inst] = nil
+			state.lastChangeClock[inst] = nil
+		end
+	end
+end
+
+local function markSkipped(obj)
+	if obj then
+		state.skippedInstances[obj] = os.clock() + state.skipCooldown
+	end
+end
+
+local function isObjAvailable(obj)
 	if not obj or not obj.Parent or not obj:IsDescendantOf(Workspace) then
 		return false
 	end
 
 	local now = os.clock()
-	local skipUntil = state.skippedTargets[obj]
+	local skipUntil = state.skippedInstances[obj]
 	if skipUntil and now < skipUntil then
 		return false
 	end
 
 	local hum = obj:FindFirstChildOfClass("Humanoid")
 	if hum and hum.Health <= 0 then
-		return false
-	end
-
-	local part = getTargetPart(obj)
-	if not part or not part.Parent then
 		return false
 	end
 
@@ -79,91 +227,11 @@ local function isTargetClickable(obj)
 	return true
 end
 
-local function cleanupExpiredSkips()
-	local now = os.clock()
-	for inst, expiry in pairs(state.skippedTargets) do
-		if not inst or not inst.Parent or now >= expiry then
-			state.skippedTargets[inst] = nil
-		end
-	end
-end
-
-local function markTargetUnclickable(obj)
-	if obj then
-		state.skippedTargets[obj] = os.clock() + state.skipCooldown
-		if state.selectedTarget == obj then
-			state.selectedTarget = nil
-		end
-	end
-end
-
-local function sampleTargetState(obj)
+local function sampleObjSig(obj)
 	if not obj or not obj.Parent then return nil end
 	local hum = obj:FindFirstChildOfClass("Humanoid")
 	local hp = hum and hum.Health or 0
-	local descCount = #obj:GetDescendants()
-	return string.format("%.2f_%d", hp, descCount)
-end
-
-local function getAllSansTargets()
-	cleanupExpiredSkips()
-	local folder = getSpawnedFolder()
-	local list = {}
-	if not folder then return list end
-
-	local root = getCharacterRoot()
-	for _, child in ipairs(folder:GetChildren()) do
-		if isTargetClickable(child) then
-			local part = getTargetPart(child)
-			if part then
-				local dist = root and (root.Position - part.Position).Magnitude or math.huge
-				table.insert(list, {
-					Instance = child,
-					Part = part,
-					Name = child.Name,
-					Distance = dist,
-				})
-			end
-		end
-	end
-
-	table.sort(list, function(a, b)
-		if a.Distance ~= b.Distance then
-			return a.Distance < b.Distance
-		end
-		return a.Name < b.Name
-	end)
-
-	return list
-end
-
-local function getActiveTarget()
-	if state.selectedTarget and isTargetClickable(state.selectedTarget) then
-		local part = getTargetPart(state.selectedTarget)
-		if part then
-			local root = getCharacterRoot()
-			local dist = root and (root.Position - part.Position).Magnitude or math.huge
-			return {
-				Instance = state.selectedTarget,
-				Part = part,
-				Name = state.selectedTarget.Name,
-				Distance = dist,
-			}
-		end
-	end
-
-	local targets = getAllSansTargets()
-	if targets[1] then
-		if state.selectedTarget ~= targets[1].Instance then
-			state.selectedTarget = targets[1].Instance
-			state.lastProgressClock = os.clock()
-			state.lastHealthOrState = sampleTargetState(targets[1].Instance)
-		end
-		return targets[1]
-	end
-
-	state.selectedTarget = nil
-	return nil
+	return string.format("%.2f_%d", hp, #obj:GetDescendants())
 end
 
 local function restoreHitboxes()
@@ -221,25 +289,15 @@ local function applyBigHitboxes()
 	end
 end
 
-RunService.Heartbeat:Connect(function()
-	if state.bigHitbox then
-		applyBigHitboxes()
+local function interactEntireFolder()
+	cleanupSkips()
+	local folder = getSpawnedFolder()
+	if not folder then return 0 end
+
+	if state.bypassPending then
+		bypassClickPending()
 	end
 
-	if not state.followTarget then return end
-	local target = getActiveTarget()
-	if not target or not target.Part or not target.Part.Parent then return end
-
-	local root = getCharacterRoot()
-	if not root then return end
-
-	local desiredPos = (target.Part.CFrame * CFrame.new(state.followOffset)).Position
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
-	root.CFrame = CFrame.lookAt(desiredPos, target.Part.Position)
-end)
-
-local function triggerBurstBatch(primaryTarget)
 	local char = LocalPlayer.Character
 	local tool = char and char:FindFirstChildOfClass("Tool")
 	if tool then
@@ -248,29 +306,34 @@ local function triggerBurstBatch(primaryTarget)
 		end)
 	end
 
-	local folder = getSpawnedFolder()
-	if not folder then return end
+	local now = os.clock()
+	local count = 0
 
-	local root = getCharacterRoot()
-	local reachRadius = state.bigHitbox and (state.hitboxScale * 0.85) or 14
+	for _, child in ipairs(folder:GetChildren()) do
+		if isObjAvailable(child) then
+			count += 1
+			local interacted = false
 
-	local function interactWithObj(obj)
-		if not obj or not obj.Parent then return end
-		for _, desc in ipairs(obj:GetDescendants()) do
-			if desc:IsA("ClickDetector") then
-				if desc.MaxActivationDistance <= 0 then
-					markTargetUnclickable(obj)
-				else
+			for _, desc in ipairs(child:GetDescendants()) do
+				if desc:IsA("ClickDetector") then
+					if desc.MaxActivationDistance <= 0 then
+						markSkipped(child)
+						interacted = false
+						break
+					end
+					interacted = true
 					pcall(function()
 						if fireclickdetector then
 							fireclickdetector(desc)
 						end
 					end)
-				end
-			elseif desc:IsA("ProximityPrompt") then
-				if not desc.Enabled then
-					markTargetUnclickable(obj)
-				else
+				elseif desc:IsA("ProximityPrompt") then
+					if not desc.Enabled then
+						markSkipped(child)
+						interacted = false
+						break
+					end
+					interacted = true
 					pcall(function()
 						if fireproximityprompt then
 							fireproximityprompt(desc)
@@ -281,43 +344,44 @@ local function triggerBurstBatch(primaryTarget)
 					end)
 				end
 			end
-		end
-	end
 
-	if primaryTarget and primaryTarget.Instance then
-		interactWithObj(primaryTarget.Instance)
-	end
-
-	for _, child in ipairs(folder:GetChildren()) do
-		if child ~= (primaryTarget and primaryTarget.Instance) and isTargetClickable(child) then
-			local p = getTargetPart(child)
-			if p and root and (root.Position - p.Position).Magnitude <= reachRadius then
-				interactWithObj(child)
+			if interacted then
+				local sig = sampleObjSig(child)
+				if state.lastStateSig[child] ~= sig then
+					state.lastStateSig[child] = sig
+					state.lastChangeClock[child] = now
+				elseif state.lastChangeClock[child] and (now - state.lastChangeClock[child]) >= state.skipCooldown then
+					markSkipped(child)
+					state.lastChangeClock[child] = now
+				end
 			end
 		end
 	end
+
+	return count
 end
 
-if PlayerGui:FindFirstChild("SpawnedSansHUD") then
-	PlayerGui.SpawnedSansHUD:Destroy()
+-- GUI gọn không có list
+if PlayerGui:FindFirstChild("SpawnedSansAllGui") then
+	PlayerGui.SpawnedSansAllGui:Destroy()
 end
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "SpawnedSansHUD"
+ScreenGui.Name = "SpawnedSansAllGui"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = PlayerGui
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.fromOffset(276, 336)
-MainFrame.Position = UDim2.new(0.5, -138, 0.5, -168)
+MainFrame.Size = UDim2.fromOffset(244, 268)
+MainFrame.Position = UDim2.new(0.5, -122, 0.5, -134)
 MainFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 16)
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
 MainFrame.Draggable = true
 MainFrame.Parent = ScreenGui
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 12)
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 11)
 
 local MainStroke = Instance.new("UIStroke")
 MainStroke.Color = Color3.fromRGB(48, 48, 56)
@@ -325,37 +389,26 @@ MainStroke.Thickness = 1
 MainStroke.Parent = MainFrame
 
 local Header = Instance.new("Frame")
-Header.Size = UDim2.new(1, 0, 0, 36)
+Header.Size = UDim2.new(1, 0, 0, 34)
 Header.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
 Header.BorderSizePixel = 0
 Header.Parent = MainFrame
-Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 12)
+Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 11)
 
 local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, -76, 1, 0)
+Title.Size = UDim2.new(1, -44, 1, 0)
 Title.Position = UDim2.fromOffset(12, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "SANS BURST // HUD"
+Title.Text = "SpawnedSans All+"
 Title.TextColor3 = Color3.fromRGB(240, 242, 248)
 Title.Font = Enum.Font.GothamBold
 Title.TextSize = 13
 Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.Parent = Header
 
-local MinBtn = Instance.new("TextButton")
-MinBtn.Size = UDim2.fromOffset(24, 24)
-MinBtn.Position = UDim2.new(1, -62, 0.5, -12)
-MinBtn.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
-MinBtn.Text = "-"
-MinBtn.TextColor3 = Color3.fromRGB(210, 210, 220)
-MinBtn.Font = Enum.Font.GothamBold
-MinBtn.TextSize = 14
-MinBtn.Parent = Header
-Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 6)
-
 local CloseBtn = Instance.new("TextButton")
 CloseBtn.Size = UDim2.fromOffset(24, 24)
-CloseBtn.Position = UDim2.new(1, -32, 0.5, -12)
+CloseBtn.Position = UDim2.new(1, -30, 0.5, -12)
 CloseBtn.BackgroundColor3 = Color3.fromRGB(45, 22, 24)
 CloseBtn.Text = "×"
 CloseBtn.TextColor3 = Color3.fromRGB(255, 115, 115)
@@ -364,14 +417,7 @@ CloseBtn.TextSize = 14
 CloseBtn.Parent = Header
 Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
 
-local Body = Instance.new("Frame")
-Body.Name = "Body"
-Body.Size = UDim2.new(1, 0, 1, -36)
-Body.Position = UDim2.fromOffset(0, 36)
-Body.BackgroundTransparency = 1
-Body.Parent = MainFrame
-
-local function createPillToggle(labelText, yPos)
+local function makeToggle(labelText, yPos)
 	local btn = Instance.new("TextButton")
 	btn.Size = UDim2.new(1, -20, 0, 30)
 	btn.Position = UDim2.fromOffset(10, yPos)
@@ -379,8 +425,8 @@ local function createPillToggle(labelText, yPos)
 	btn.Text = labelText .. " · OFF"
 	btn.TextColor3 = Color3.fromRGB(205, 208, 218)
 	btn.Font = Enum.Font.GothamSemibold
-	btn.TextSize = 12
-	btn.Parent = Body
+	btn.TextSize = 11
+	btn.Parent = MainFrame
 	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
 
 	local stroke = Instance.new("UIStroke")
@@ -391,127 +437,48 @@ local function createPillToggle(labelText, yPos)
 	return btn, stroke
 end
 
-local FollowBtn, FollowStroke = createPillToggle("Bám Mục Tiêu", 8)
-local BurstBtn, BurstStroke = createPillToggle("Click Dồn Dập", 43)
-local HitboxBtn, HitboxStroke = createPillToggle("Hitbox To (Multi)", 78)
+local ClickAllBtn, ClickAllStroke = makeToggle("Click Toàn Bộ Folder", 40)
+local HitboxBtn, HitboxStroke = makeToggle("Hitbox To (All)", 74)
+local NoCDBtn, NoCDStroke = makeToggle("Skill No CD", 108)
+local GodBtn, GodStroke = makeToggle("Godmode", 142)
+local PendingBtn, PendingStroke = makeToggle("Bypass ClickPending", 176)
 
-local NextBtn = Instance.new("TextButton")
-NextBtn.Size = UDim2.new(0.5, -13, 0, 26)
-NextBtn.Position = UDim2.fromOffset(10, 113)
-NextBtn.BackgroundColor3 = Color3.fromRGB(28, 34, 46)
-NextBtn.Text = "Đổi Con Khác"
-NextBtn.TextColor3 = Color3.fromRGB(175, 205, 255)
-NextBtn.Font = Enum.Font.GothamSemibold
-NextBtn.TextSize = 11
-NextBtn.Parent = Body
-Instance.new("UICorner", NextBtn).CornerRadius = UDim.new(0, 7)
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Size = UDim2.new(1, -20, 0, 24)
+StatusLabel.Position = UDim2.fromOffset(10, 236)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Text = "Folder: 0 active"
+StatusLabel.TextColor3 = Color3.fromRGB(150, 156, 172)
+StatusLabel.Font = Enum.Font.GothamMedium
+StatusLabel.TextSize = 11
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.Parent = MainFrame
 
-local ResetSkipBtn = Instance.new("TextButton")
-ResetSkipBtn.Size = UDim2.new(0.5, -13, 0, 26)
-ResetSkipBtn.Position = UDim2.new(0.5, 3, 0, 113)
-ResetSkipBtn.BackgroundColor3 = Color3.fromRGB(38, 30, 46)
-ResetSkipBtn.Text = "Reset Bỏ Qua"
-ResetSkipBtn.TextColor3 = Color3.fromRGB(215, 185, 255)
-ResetSkipBtn.Font = Enum.Font.GothamSemibold
-ResetSkipBtn.TextSize = 11
-ResetSkipBtn.Parent = Body
-Instance.new("UICorner", ResetSkipBtn).CornerRadius = UDim.new(0, 7)
-
-local InfoBar = Instance.new("TextLabel")
-InfoBar.Size = UDim2.new(1, -20, 0, 18)
-InfoBar.Position = UDim2.fromOffset(10, 143)
-InfoBar.BackgroundTransparency = 1
-InfoBar.Text = "Active: 0 | Target: None"
-InfoBar.TextColor3 = Color3.fromRGB(145, 152, 170)
-InfoBar.Font = Enum.Font.GothamMedium
-InfoBar.TextSize = 11
-InfoBar.TextXAlignment = Enum.TextXAlignment.Left
-InfoBar.Parent = Body
-
-local ScrollList = Instance.new("ScrollingFrame")
-ScrollList.Size = UDim2.new(1, -20, 1, -171)
-ScrollList.Position = UDim2.fromOffset(10, 163)
-ScrollList.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
-ScrollList.BorderSizePixel = 0
-ScrollList.ScrollBarThickness = 3
-ScrollList.CanvasSize = UDim2.fromOffset(0, 0)
-ScrollList.Parent = Body
-Instance.new("UICorner", ScrollList).CornerRadius = UDim.new(0, 8)
-
-local Layout = Instance.new("UIListLayout")
-Layout.Padding = UDim.new(0, 4)
-Layout.SortOrder = Enum.SortOrder.LayoutOrder
-Layout.Parent = ScrollList
-
-local Pad = Instance.new("UIPadding")
-Pad.PaddingTop = UDim.new(0, 5)
-Pad.PaddingBottom = UDim.new(0, 5)
-Pad.PaddingLeft = UDim.new(0, 5)
-Pad.PaddingRight = UDim.new(0, 5)
-Pad.Parent = ScrollList
-
-local function styleToggle(btn, stroke, title, active)
+local function setToggleState(btn, stroke, title, active)
 	btn.Text = title .. (active and " · ON" or " · OFF")
 	btn.BackgroundColor3 = active and Color3.fromRGB(22, 68, 46) or Color3.fromRGB(24, 24, 29)
 	btn.TextColor3 = active and Color3.fromRGB(145, 255, 190) or Color3.fromRGB(205, 208, 218)
 	stroke.Color = active and Color3.fromRGB(48, 150, 98) or Color3.fromRGB(42, 42, 50)
 end
 
-local function refreshList()
-	for _, child in ipairs(ScrollList:GetChildren()) do
-		if child:IsA("TextButton") then
-			child:Destroy()
+ClickAllBtn.MouseButton1Click:Connect(function()
+	state.clickAll = not state.clickAll
+	setToggleState(ClickAllBtn, ClickAllStroke, "Click Toàn Bộ Folder", state.clickAll)
+	if state.clickAll then
+		local now = os.clock()
+		local folder = getSpawnedFolder()
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				state.lastStateSig[child] = sampleObjSig(child)
+				state.lastChangeClock[child] = now
+			end
 		end
-	end
-
-	local targets = getAllSansTargets()
-	local active = getActiveTarget()
-	local tLabel = active and string.format("%s (%.0fm)", active.Name, active.Distance) or "None"
-	InfoBar.Text = string.format("Active: %d | Target: %s", #targets, tLabel)
-
-	for i, item in ipairs(targets) do
-		local row = Instance.new("TextButton")
-		row.Size = UDim2.new(1, 0, 0, 25)
-		row.LayoutOrder = i
-		local selected = (state.selectedTarget == item.Instance)
-		row.BackgroundColor3 = selected and Color3.fromRGB(42, 54, 84) or Color3.fromRGB(27, 27, 33)
-		row.Text = string.format("%d. %s  ·  %.0f", i, item.Name, item.Distance)
-		row.TextColor3 = selected and Color3.fromRGB(210, 230, 255) or Color3.fromRGB(220, 222, 230)
-		row.Font = Enum.Font.GothamMedium
-		row.TextSize = 11
-		row.TextTruncate = Enum.TextTruncate.AtEnd
-		row.Parent = ScrollList
-		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
-
-		row.MouseButton1Click:Connect(function()
-			state.selectedTarget = item.Instance
-			state.lastProgressClock = os.clock()
-			state.lastHealthOrState = sampleTargetState(item.Instance)
-			refreshList()
-		end)
-	end
-
-	task.wait()
-	ScrollList.CanvasSize = UDim2.fromOffset(0, Layout.AbsoluteContentSize.Y + 10)
-end
-
-FollowBtn.MouseButton1Click:Connect(function()
-	state.followTarget = not state.followTarget
-	styleToggle(FollowBtn, FollowStroke, "Bám Mục Tiêu", state.followTarget)
-end)
-
-BurstBtn.MouseButton1Click:Connect(function()
-	state.burstClick = not state.burstClick
-	styleToggle(BurstBtn, BurstStroke, "Click Dồn Dập", state.burstClick)
-	if state.burstClick then
-		state.lastProgressClock = os.clock()
-		state.lastHealthOrState = sampleTargetState(state.selectedTarget)
 	end
 end)
 
 HitboxBtn.MouseButton1Click:Connect(function()
 	state.bigHitbox = not state.bigHitbox
-	styleToggle(HitboxBtn, HitboxStroke, "Hitbox To (Multi)", state.bigHitbox)
+	setToggleState(HitboxBtn, HitboxStroke, "Hitbox To (All)", state.bigHitbox)
 	if state.bigHitbox then
 		applyBigHitboxes()
 	else
@@ -519,68 +486,77 @@ HitboxBtn.MouseButton1Click:Connect(function()
 	end
 end)
 
-NextBtn.MouseButton1Click:Connect(function()
-	local current = state.selectedTarget
-	if current then
-		markTargetUnclickable(current)
+NoCDBtn.MouseButton1Click:Connect(function()
+	state.noCooldown = not state.noCooldown
+	setToggleState(NoCDBtn, NoCDStroke, "Skill No CD", state.noCooldown)
+	if state.noCooldown then
+		applyNoCooldown()
+	else
+		restoreCooldowns()
 	end
-	local targets = getAllSansTargets()
-	if targets[1] then
-		state.selectedTarget = targets[1].Instance
-		state.lastProgressClock = os.clock()
-		state.lastHealthOrState = sampleTargetState(targets[1].Instance)
-	end
-	refreshList()
 end)
 
-ResetSkipBtn.MouseButton1Click:Connect(function()
-	table.clear(state.skippedTargets)
-	refreshList()
+GodBtn.MouseButton1Click:Connect(function()
+	state.godMode = not state.godMode
+	setToggleState(GodBtn, GodStroke, "Godmode", state.godMode)
+	if state.godMode then
+		applyGodMode()
+	end
 end)
 
-local minimized = false
-MinBtn.MouseButton1Click:Connect(function()
-	minimized = not minimized
-	Body.Visible = not minimized
-	MainFrame.Size = minimized and UDim2.fromOffset(276, 36) or UDim2.fromOffset(276, 336)
-	MinBtn.Text = minimized and "+" or "-"
+PendingBtn.MouseButton1Click:Connect(function()
+	state.bypassPending = not state.bypassPending
+	setToggleState(PendingBtn, PendingStroke, "Bypass ClickPending", state.bypassPending)
+	if state.bypassPending then
+		bypassClickPending()
+	end
 end)
 
 CloseBtn.MouseButton1Click:Connect(function()
-	state.followTarget = false
-	state.burstClick = false
+	state.clickAll = false
 	state.bigHitbox = false
+	state.noCooldown = false
+	state.godMode = false
+	state.bypassPending = false
 	restoreHitboxes()
+	restoreCooldowns()
 	ScreenGui:Destroy()
 end)
 
 RunService.Heartbeat:Connect(function()
-	local target = getActiveTarget()
-
-	if state.selectedTarget and not isTargetClickable(state.selectedTarget) then
-		state.selectedTarget = nil
-		target = getActiveTarget()
+	if state.bigHitbox then
+		applyBigHitboxes()
 	end
-
-	if state.burstClick and target and target.Instance then
-		triggerBurstBatch(target)
-
-		local sig = sampleTargetState(target.Instance)
-		local now = os.clock()
-		if sig ~= state.lastHealthOrState then
-			state.lastHealthOrState = sig
-			state.lastProgressClock = now
-		elseif (now - state.lastProgressClock) >= state.skipCooldown then
-			markTargetUnclickable(target.Instance)
-			state.lastProgressClock = now
-			getActiveTarget()
-		end
+	if state.noCooldown then
+		applyNoCooldown()
+	end
+	if state.godMode then
+		applyGodMode()
+	end
+	if state.bypassPending then
+		bypassClickPending()
+	end
+	if state.clickAll then
+		local activeCount = interactEntireFolder()
+		StatusLabel.Text = string.format("Folder: %d active", activeCount)
 	end
 end)
 
 task.spawn(function()
 	while ScreenGui.Parent do
-		refreshList()
-		task.wait(1.0)
+		if not state.clickAll then
+			cleanupSkips()
+			local folder = getSpawnedFolder()
+			local count = 0
+			if folder then
+				for _, child in ipairs(folder:GetChildren()) do
+					if isObjAvailable(child) then
+						count += 1
+					end
+				end
+			end
+			StatusLabel.Text = string.format("Folder: %d active", count)
+		end
+		task.wait(0.5)
 	end
 end)
