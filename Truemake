@@ -1,234 +1,586 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
 
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- Cấu hình phím & thông số ShiftLock PC
-local SHIFT_LOCK_KEY = Enum.KeyCode.LeftShift
-local ALT_SHIFT_LOCK_KEY = Enum.KeyCode.RightShift
-local TOGGLE_SCRIPT_KEY = Enum.KeyCode.F3
+local state = {
+	followTarget = false,
+	burstClick = false,
+	bigHitbox = false,
+	hitboxScale = 22,
+	followOffset = Vector3.new(0, 0, 3.5),
+	selectedTarget = nil,
+	skippedTargets = {}, -- [Instance] = os.clock()
+	skipCooldown = 0.5,  -- Bỏ qua sau 0.5s nếu không click/tiến triển được
+	lastProgressClock = 0,
+	lastHealthOrState = nil,
+}
 
-local SHOULDER_OFFSET = Vector3.new(1.75, 0, 0) -- Lệch vai phải giống ShiftLock PC (đặt 0,0,0 nếu muốn chính giữa)
-local USE_CUSTOM_CROSSHAIR = true
-local CROSSHAIR_TEXT = "+" -- Có thể đổi thành "•" hoặc "x"
-local CROSSHAIR_SIZE = 26
-local CROSSHAIR_COLOR = Color3.fromRGB(255, 255, 255)
+local expandedParts = {}
 
-local sensX = 0.0045
-local sensY = 0.0045
-local maxStepDelta = 65
-local maxPitch = math.rad(82)
-local turnAlpha = 0.65
+local function getCharacter()
+	return LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+end
 
-local scriptEnabled = true
-local shiftLockActive = false
-local yaw = 0
-local pitch = 0.15
-local pendingDelta = Vector2.zero
+local function getCharacterRoot()
+	local char = getCharacter()
+	return char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart")
+end
 
-local savedBehavior = UserInputService.MouseBehavior
-local savedIconEnabled = UserInputService.MouseIconEnabled
-local BIND_NAME = "PCStyleShiftLockWithCrosshair"
+local function getSpawnedFolder()
+	return Workspace:FindFirstChild("SpawnedSans")
+end
 
-workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-	camera = workspace.CurrentCamera
-end)
+local function getTargetPart(obj)
+	if not obj or not obj.Parent then return nil end
+	if obj:IsA("BasePart") then return obj end
+	if obj:IsA("Model") then
+		return obj.PrimaryPart
+			or obj:FindFirstChild("HumanoidRootPart")
+			or obj:FindFirstChild("Torso")
+			or obj:FindFirstChild("UpperTorso")
+			or obj:FindFirstChild("Head")
+			or obj:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return obj:FindFirstChildWhichIsA("BasePart", true)
+end
 
--- ScreenGui chứa Crosshair ở chính giữa màn hình
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "ShiftLockCrosshairGui"
-screenGui.ResetOnSpawn = false
-screenGui.IgnoreGuiInset = true
-screenGui.DisplayOrder = 1000
-screenGui.Parent = playerGui
+local function isTargetClickable(obj)
+	if not obj or not obj.Parent or not obj:IsDescendantOf(Workspace) then
+		return false
+	end
 
-local crosshairLabel = Instance.new("TextLabel")
-crosshairLabel.Name = "CenterCrosshair"
-crosshairLabel.BackgroundTransparency = 1
-crosshairLabel.Size = UDim2.fromOffset(CROSSHAIR_SIZE, CROSSHAIR_SIZE)
-crosshairLabel.Position = UDim2.fromScale(0.5, 0.5)
-crosshairLabel.AnchorPoint = Vector2.new(0.5, 0.5)
-crosshairLabel.Font = Enum.Font.GothamBold
-crosshairLabel.Text = CROSSHAIR_TEXT
-crosshairLabel.TextColor3 = CROSSHAIR_COLOR
-crosshairLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-crosshairLabel.TextStrokeTransparency = 0.2
-crosshairLabel.TextSize = CROSSHAIR_SIZE - 4
-crosshairLabel.Visible = false
-crosshairLabel.ZIndex = 100
-crosshairLabel.Parent = screenGui
+	local now = os.clock()
+	local skipUntil = state.skippedTargets[obj]
+	if skipUntil and now < skipUntil then
+		return false
+	end
 
--- Lấy RootPart / Humanoid của nhân vật hiện tại hoặc Morph
-local function getControlledRootAndHumanoid(): (BasePart?, Humanoid?)
-	if camera and camera.CameraSubject then
-		local subj = camera.CameraSubject
-		if subj:IsA("Humanoid") then
-			local model = subj.Parent
-			local root = subj.RootPart
-				or (model and model:IsA("Model") and model.PrimaryPart)
-				or (model and model:FindFirstChild("HumanoidRootPart") :: BasePart?)
-			return root, subj
-		elseif subj:IsA("BasePart") then
-			local model = subj:FindFirstAncestorOfClass("Model")
-			local hum = model and model:FindFirstChildOfClass("Humanoid")
-			local root = (hum and hum.RootPart) or (model and model.PrimaryPart) or subj
-			return root, hum
+	local hum = obj:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health <= 0 then
+		return false
+	end
+
+	local part = getTargetPart(obj)
+	if not part or not part.Parent then
+		return false
+	end
+
+	for _, desc in ipairs(obj:GetDescendants()) do
+		if desc:IsA("ClickDetector") and desc.MaxActivationDistance <= 0 then
+			return false
+		elseif desc:IsA("ProximityPrompt") and not desc.Enabled then
+			return false
 		end
 	end
 
-	local char = player.Character
-	if char then
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		local root = (hum and hum.RootPart)
-			or char.PrimaryPart
-			or (char:FindFirstChild("HumanoidRootPart") :: BasePart?)
-		return root, hum
-	end
-
-	return nil, nil
+	return true
 end
 
-local function syncAnglesFromCamera()
-	if not camera then
-		return
-	end
-	local look = camera.CFrame.LookVector
-	yaw = math.atan2(-look.X, -look.Z)
-	pitch = math.clamp(math.asin(math.clamp(look.Y, -1, 1)), -maxPitch, maxPitch)
-end
-
-local function applyShiftLockState()
-	local active = scriptEnabled and shiftLockActive
-	crosshairLabel.Visible = active and USE_CUSTOM_CROSSHAIR
-
-	if not active then
-		UserInputService.MouseBehavior = savedBehavior
-		UserInputService.MouseIconEnabled = savedIconEnabled
-		return
-	end
-
-	UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-	UserInputService.MouseIconEnabled = false
-end
-
-local function setShiftLock(state: boolean)
-	shiftLockActive = state
-	pendingDelta = Vector2.zero
-	if shiftLockActive then
-		syncAnglesFromCamera()
-	end
-	applyShiftLockState()
-end
-
-local function consumeDelta()
-	local d = pendingDelta
-	pendingDelta = Vector2.zero
-	if d.Magnitude == 0 then
-		d = UserInputService:GetMouseDelta()
-	end
-	local dx = math.clamp(d.X, -maxStepDelta, maxStepDelta)
-	local dy = math.clamp(d.Y, -maxStepDelta, maxStepDelta)
-	return dx, dy
-end
-
-local function rotateControlledEntity()
-	local root, hum = getControlledRootAndHumanoid()
-	if not root then
-		return
-	end
-	if hum and (hum.Sit or hum.Health <= 0) then
-		return
-	end
-	if root.Anchored then
-		return
-	end
-
-	local flatLook = Vector3.new(-math.sin(yaw), 0, -math.cos(yaw))
-	if flatLook.Magnitude > 1e-4 then
-		flatLook = flatLook.Unit
-		local targetCF = CFrame.lookAt(root.Position, root.Position + flatLook)
-		root.CFrame = root.CFrame:Lerp(targetCF, turnAlpha)
-	end
-end
-
-local function onRenderStep()
-	if not scriptEnabled or not shiftLockActive or not camera then
-		return
-	end
-
-	if UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
-		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-	end
-	if UserInputService.MouseIconEnabled then
-		UserInputService.MouseIconEnabled = false
-	end
-	if USE_CUSTOM_CROSSHAIR and not crosshairLabel.Visible then
-		crosshairLabel.Visible = true
-	end
-
-	local dx, dy = consumeDelta()
-	yaw -= dx * sensX
-	pitch = math.clamp(pitch - dy * sensY, -maxPitch, maxPitch)
-
-	if camera.CameraType == Enum.CameraType.Custom or camera.CameraType == Enum.CameraType.Scriptable then
-		local root, _ = getControlledRootAndHumanoid()
-		local baseFocus = root and (root.Position + Vector3.new(0, 1.5, 0)) or camera.Focus.Position
-
-		local dist = (camera.CFrame.Position - camera.Focus.Position).Magnitude
-		if dist < 2 then
-			dist = 10
+local function cleanupExpiredSkips()
+	local now = os.clock()
+	for inst, expiry in pairs(state.skippedTargets) do
+		if not inst or not inst.Parent or now >= expiry then
+			state.skippedTargets[inst] = nil
 		end
-
-		local rotCF = CFrame.fromOrientation(pitch, yaw, 0)
-		local worldShoulderOffset = (rotCF.RightVector * SHOULDER_OFFSET.X) + (Vector3.yAxis * SHOULDER_OFFSET.Y)
-		local focusWithShoulder = baseFocus + worldShoulderOffset
-
-		local lookDir = rotCF.LookVector
-		local camPos = focusWithShoulder - (lookDir * dist)
-		camera.CFrame = CFrame.lookAt(camPos, camPos + lookDir)
 	end
-
-	rotateControlledEntity()
 end
 
-UserInputService.InputChanged:Connect(function(input, _gameProcessed)
-	if not scriptEnabled or not shiftLockActive then
-		return
+local function markTargetUnclickable(obj)
+	if obj then
+		state.skippedTargets[obj] = os.clock() + state.skipCooldown
+		if state.selectedTarget == obj then
+			state.selectedTarget = nil
+		end
 	end
-	if input.UserInputType == Enum.UserInputType.MouseMovement then
-		local d = input.Delta
-		if d and (d.X ~= 0 or d.Y ~= 0) then
-			pendingDelta += Vector2.new(d.X, d.Y)
+end
+
+local function sampleTargetState(obj)
+	if not obj or not obj.Parent then return nil end
+	local hum = obj:FindFirstChildOfClass("Humanoid")
+	local hp = hum and hum.Health or 0
+	local descCount = #obj:GetDescendants()
+	return string.format("%.2f_%d", hp, descCount)
+end
+
+local function getAllSansTargets()
+	cleanupExpiredSkips()
+	local folder = getSpawnedFolder()
+	local list = {}
+	if not folder then return list end
+
+	local root = getCharacterRoot()
+	for _, child in ipairs(folder:GetChildren()) do
+		if isTargetClickable(child) then
+			local part = getTargetPart(child)
+			if part then
+				local dist = root and (root.Position - part.Position).Magnitude or math.huge
+				table.insert(list, {
+					Instance = child,
+					Part = part,
+					Name = child.Name,
+					Distance = dist,
+				})
+			end
+		end
+	end
+
+	table.sort(list, function(a, b)
+		if a.Distance ~= b.Distance then
+			return a.Distance < b.Distance
+		end
+		return a.Name < b.Name
+	end)
+
+	return list
+end
+
+local function getActiveTarget()
+	if state.selectedTarget and isTargetClickable(state.selectedTarget) then
+		local part = getTargetPart(state.selectedTarget)
+		if part then
+			local root = getCharacterRoot()
+			local dist = root and (root.Position - part.Position).Magnitude or math.huge
+			return {
+				Instance = state.selectedTarget,
+				Part = part,
+				Name = state.selectedTarget.Name,
+				Distance = dist,
+			}
+		end
+	end
+
+	local targets = getAllSansTargets()
+	if targets[1] then
+		if state.selectedTarget ~= targets[1].Instance then
+			state.selectedTarget = targets[1].Instance
+			state.lastProgressClock = os.clock()
+			state.lastHealthOrState = sampleTargetState(targets[1].Instance)
+		end
+		return targets[1]
+	end
+
+	state.selectedTarget = nil
+	return nil
+end
+
+local function restoreHitboxes()
+	for part, saved in pairs(expandedParts) do
+		if part and part.Parent then
+			pcall(function()
+				part.Size = saved.Size
+				part.Transparency = saved.Transparency
+				part.CanCollide = saved.CanCollide
+				part.Massless = saved.Massless
+			end)
+		end
+		expandedParts[part] = nil
+	end
+end
+
+local function applyBigHitboxes()
+	local folder = getSpawnedFolder()
+	if not folder then return end
+
+	local activeSet = {}
+	for _, child in ipairs(folder:GetChildren()) do
+		local part = getTargetPart(child)
+		if part and part:IsA("BasePart") then
+			activeSet[part] = true
+			if not expandedParts[part] then
+				expandedParts[part] = {
+					Size = part.Size,
+					Transparency = part.Transparency,
+					CanCollide = part.CanCollide,
+					Massless = part.Massless,
+				}
+			end
+			pcall(function()
+				part.Size = Vector3.new(state.hitboxScale, state.hitboxScale, state.hitboxScale)
+				part.Transparency = math.max(expandedParts[part].Transparency, 0.75)
+				part.CanCollide = false
+				part.Massless = true
+			end)
+		end
+	end
+
+	for part, saved in pairs(expandedParts) do
+		if not activeSet[part] then
+			if part and part.Parent then
+				pcall(function()
+					part.Size = saved.Size
+					part.Transparency = saved.Transparency
+					part.CanCollide = saved.CanCollide
+					part.Massless = saved.Massless
+				end)
+			end
+			expandedParts[part] = nil
+		end
+	end
+end
+
+RunService.Heartbeat:Connect(function()
+	if state.bigHitbox then
+		applyBigHitboxes()
+	end
+
+	if not state.followTarget then return end
+	local target = getActiveTarget()
+	if not target or not target.Part or not target.Part.Parent then return end
+
+	local root = getCharacterRoot()
+	if not root then return end
+
+	local desiredPos = (target.Part.CFrame * CFrame.new(state.followOffset)).Position
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = CFrame.lookAt(desiredPos, target.Part.Position)
+end)
+
+local function triggerBurstBatch(primaryTarget)
+	local char = LocalPlayer.Character
+	local tool = char and char:FindFirstChildOfClass("Tool")
+	if tool then
+		pcall(function()
+			tool:Activate()
+		end)
+	end
+
+	local folder = getSpawnedFolder()
+	if not folder then return end
+
+	local root = getCharacterRoot()
+	local reachRadius = state.bigHitbox and (state.hitboxScale * 0.85) or 14
+
+	local function interactWithObj(obj)
+		if not obj or not obj.Parent then return end
+		for _, desc in ipairs(obj:GetDescendants()) do
+			if desc:IsA("ClickDetector") then
+				if desc.MaxActivationDistance <= 0 then
+					markTargetUnclickable(obj)
+				else
+					pcall(function()
+						if fireclickdetector then
+							fireclickdetector(desc)
+						end
+					end)
+				end
+			elseif desc:IsA("ProximityPrompt") then
+				if not desc.Enabled then
+					markTargetUnclickable(obj)
+				else
+					pcall(function()
+						if fireproximityprompt then
+							fireproximityprompt(desc)
+						else
+							desc:InputHoldBegin()
+							desc:InputHoldEnd()
+						end
+					end)
+				end
+			end
+		end
+	end
+
+	if primaryTarget and primaryTarget.Instance then
+		interactWithObj(primaryTarget.Instance)
+	end
+
+	for _, child in ipairs(folder:GetChildren()) do
+		if child ~= (primaryTarget and primaryTarget.Instance) and isTargetClickable(child) then
+			local p = getTargetPart(child)
+			if p and root and (root.Position - p.Position).Magnitude <= reachRadius then
+				interactWithObj(child)
+			end
+		end
+	end
+end
+
+if PlayerGui:FindFirstChild("SpawnedSansHUD") then
+	PlayerGui.SpawnedSansHUD:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "SpawnedSansHUD"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = PlayerGui
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.fromOffset(276, 336)
+MainFrame.Position = UDim2.new(0.5, -138, 0.5, -168)
+MainFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 16)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 12)
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(48, 48, 56)
+MainStroke.Thickness = 1
+MainStroke.Parent = MainFrame
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 36)
+Header.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 12)
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -76, 1, 0)
+Title.Position = UDim2.fromOffset(12, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "SANS BURST // HUD"
+Title.TextColor3 = Color3.fromRGB(240, 242, 248)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 13
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
+
+local MinBtn = Instance.new("TextButton")
+MinBtn.Size = UDim2.fromOffset(24, 24)
+MinBtn.Position = UDim2.new(1, -62, 0.5, -12)
+MinBtn.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
+MinBtn.Text = "-"
+MinBtn.TextColor3 = Color3.fromRGB(210, 210, 220)
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.TextSize = 14
+MinBtn.Parent = Header
+Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 6)
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.fromOffset(24, 24)
+CloseBtn.Position = UDim2.new(1, -32, 0.5, -12)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(45, 22, 24)
+CloseBtn.Text = "×"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 115, 115)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 14
+CloseBtn.Parent = Header
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
+
+local Body = Instance.new("Frame")
+Body.Name = "Body"
+Body.Size = UDim2.new(1, 0, 1, -36)
+Body.Position = UDim2.fromOffset(0, 36)
+Body.BackgroundTransparency = 1
+Body.Parent = MainFrame
+
+local function createPillToggle(labelText, yPos)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, -20, 0, 30)
+	btn.Position = UDim2.fromOffset(10, yPos)
+	btn.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+	btn.Text = labelText .. " · OFF"
+	btn.TextColor3 = Color3.fromRGB(205, 208, 218)
+	btn.Font = Enum.Font.GothamSemibold
+	btn.TextSize = 12
+	btn.Parent = Body
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(42, 42, 50)
+	stroke.Thickness = 1
+	stroke.Parent = btn
+
+	return btn, stroke
+end
+
+local FollowBtn, FollowStroke = createPillToggle("Bám Mục Tiêu", 8)
+local BurstBtn, BurstStroke = createPillToggle("Click Dồn Dập", 43)
+local HitboxBtn, HitboxStroke = createPillToggle("Hitbox To (Multi)", 78)
+
+local NextBtn = Instance.new("TextButton")
+NextBtn.Size = UDim2.new(0.5, -13, 0, 26)
+NextBtn.Position = UDim2.fromOffset(10, 113)
+NextBtn.BackgroundColor3 = Color3.fromRGB(28, 34, 46)
+NextBtn.Text = "Đổi Con Khác"
+NextBtn.TextColor3 = Color3.fromRGB(175, 205, 255)
+NextBtn.Font = Enum.Font.GothamSemibold
+NextBtn.TextSize = 11
+NextBtn.Parent = Body
+Instance.new("UICorner", NextBtn).CornerRadius = UDim.new(0, 7)
+
+local ResetSkipBtn = Instance.new("TextButton")
+ResetSkipBtn.Size = UDim2.new(0.5, -13, 0, 26)
+ResetSkipBtn.Position = UDim2.new(0.5, 3, 0, 113)
+ResetSkipBtn.BackgroundColor3 = Color3.fromRGB(38, 30, 46)
+ResetSkipBtn.Text = "Reset Bỏ Qua"
+ResetSkipBtn.TextColor3 = Color3.fromRGB(215, 185, 255)
+ResetSkipBtn.Font = Enum.Font.GothamSemibold
+ResetSkipBtn.TextSize = 11
+ResetSkipBtn.Parent = Body
+Instance.new("UICorner", ResetSkipBtn).CornerRadius = UDim.new(0, 7)
+
+local InfoBar = Instance.new("TextLabel")
+InfoBar.Size = UDim2.new(1, -20, 0, 18)
+InfoBar.Position = UDim2.fromOffset(10, 143)
+InfoBar.BackgroundTransparency = 1
+InfoBar.Text = "Active: 0 | Target: None"
+InfoBar.TextColor3 = Color3.fromRGB(145, 152, 170)
+InfoBar.Font = Enum.Font.GothamMedium
+InfoBar.TextSize = 11
+InfoBar.TextXAlignment = Enum.TextXAlignment.Left
+InfoBar.Parent = Body
+
+local ScrollList = Instance.new("ScrollingFrame")
+ScrollList.Size = UDim2.new(1, -20, 1, -171)
+ScrollList.Position = UDim2.fromOffset(10, 163)
+ScrollList.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+ScrollList.BorderSizePixel = 0
+ScrollList.ScrollBarThickness = 3
+ScrollList.CanvasSize = UDim2.fromOffset(0, 0)
+ScrollList.Parent = Body
+Instance.new("UICorner", ScrollList).CornerRadius = UDim.new(0, 8)
+
+local Layout = Instance.new("UIListLayout")
+Layout.Padding = UDim.new(0, 4)
+Layout.SortOrder = Enum.SortOrder.LayoutOrder
+Layout.Parent = ScrollList
+
+local Pad = Instance.new("UIPadding")
+Pad.PaddingTop = UDim.new(0, 5)
+Pad.PaddingBottom = UDim.new(0, 5)
+Pad.PaddingLeft = UDim.new(0, 5)
+Pad.PaddingRight = UDim.new(0, 5)
+Pad.Parent = ScrollList
+
+local function styleToggle(btn, stroke, title, active)
+	btn.Text = title .. (active and " · ON" or " · OFF")
+	btn.BackgroundColor3 = active and Color3.fromRGB(22, 68, 46) or Color3.fromRGB(24, 24, 29)
+	btn.TextColor3 = active and Color3.fromRGB(145, 255, 190) or Color3.fromRGB(205, 208, 218)
+	stroke.Color = active and Color3.fromRGB(48, 150, 98) or Color3.fromRGB(42, 42, 50)
+end
+
+local function refreshList()
+	for _, child in ipairs(ScrollList:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	local targets = getAllSansTargets()
+	local active = getActiveTarget()
+	local tLabel = active and string.format("%s (%.0fm)", active.Name, active.Distance) or "None"
+	InfoBar.Text = string.format("Active: %d | Target: %s", #targets, tLabel)
+
+	for i, item in ipairs(targets) do
+		local row = Instance.new("TextButton")
+		row.Size = UDim2.new(1, 0, 0, 25)
+		row.LayoutOrder = i
+		local selected = (state.selectedTarget == item.Instance)
+		row.BackgroundColor3 = selected and Color3.fromRGB(42, 54, 84) or Color3.fromRGB(27, 27, 33)
+		row.Text = string.format("%d. %s  ·  %.0f", i, item.Name, item.Distance)
+		row.TextColor3 = selected and Color3.fromRGB(210, 230, 255) or Color3.fromRGB(220, 222, 230)
+		row.Font = Enum.Font.GothamMedium
+		row.TextSize = 11
+		row.TextTruncate = Enum.TextTruncate.AtEnd
+		row.Parent = ScrollList
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+		row.MouseButton1Click:Connect(function()
+			state.selectedTarget = item.Instance
+			state.lastProgressClock = os.clock()
+			state.lastHealthOrState = sampleTargetState(item.Instance)
+			refreshList()
+		end)
+	end
+
+	task.wait()
+	ScrollList.CanvasSize = UDim2.fromOffset(0, Layout.AbsoluteContentSize.Y + 10)
+end
+
+FollowBtn.MouseButton1Click:Connect(function()
+	state.followTarget = not state.followTarget
+	styleToggle(FollowBtn, FollowStroke, "Bám Mục Tiêu", state.followTarget)
+end)
+
+BurstBtn.MouseButton1Click:Connect(function()
+	state.burstClick = not state.burstClick
+	styleToggle(BurstBtn, BurstStroke, "Click Dồn Dập", state.burstClick)
+	if state.burstClick then
+		state.lastProgressClock = os.clock()
+		state.lastHealthOrState = sampleTargetState(state.selectedTarget)
+	end
+end)
+
+HitboxBtn.MouseButton1Click:Connect(function()
+	state.bigHitbox = not state.bigHitbox
+	styleToggle(HitboxBtn, HitboxStroke, "Hitbox To (Multi)", state.bigHitbox)
+	if state.bigHitbox then
+		applyBigHitboxes()
+	else
+		restoreHitboxes()
+	end
+end)
+
+NextBtn.MouseButton1Click:Connect(function()
+	local current = state.selectedTarget
+	if current then
+		markTargetUnclickable(current)
+	end
+	local targets = getAllSansTargets()
+	if targets[1] then
+		state.selectedTarget = targets[1].Instance
+		state.lastProgressClock = os.clock()
+		state.lastHealthOrState = sampleTargetState(targets[1].Instance)
+	end
+	refreshList()
+end)
+
+ResetSkipBtn.MouseButton1Click:Connect(function()
+	table.clear(state.skippedTargets)
+	refreshList()
+end)
+
+local minimized = false
+MinBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	Body.Visible = not minimized
+	MainFrame.Size = minimized and UDim2.fromOffset(276, 36) or UDim2.fromOffset(276, 336)
+	MinBtn.Text = minimized and "+" or "-"
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+	state.followTarget = false
+	state.burstClick = false
+	state.bigHitbox = false
+	restoreHitboxes()
+	ScreenGui:Destroy()
+end)
+
+RunService.Heartbeat:Connect(function()
+	local target = getActiveTarget()
+
+	if state.selectedTarget and not isTargetClickable(state.selectedTarget) then
+		state.selectedTarget = nil
+		target = getActiveTarget()
+	end
+
+	if state.burstClick and target and target.Instance then
+		triggerBurstBatch(target)
+
+		local sig = sampleTargetState(target.Instance)
+		local now = os.clock()
+		if sig ~= state.lastHealthOrState then
+			state.lastHealthOrState = sig
+			state.lastProgressClock = now
+		elseif (now - state.lastProgressClock) >= state.skipCooldown then
+			markTargetUnclickable(target.Instance)
+			state.lastProgressClock = now
+			getActiveTarget()
 		end
 	end
 end)
 
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if input.KeyCode == TOGGLE_SCRIPT_KEY then
-		scriptEnabled = not scriptEnabled
-		if not scriptEnabled then
-			shiftLockActive = false
-			pendingDelta = Vector2.zero
-		end
-		applyShiftLockState()
-		return
-	end
-
-	if not scriptEnabled or gameProcessed then
-		return
-	end
-
-	if input.KeyCode == SHIFT_LOCK_KEY or input.KeyCode == ALT_SHIFT_LOCK_KEY then
-		setShiftLock(not shiftLockActive)
+task.spawn(function()
+	while ScreenGui.Parent do
+		refreshList()
+		task.wait(1.0)
 	end
 end)
-
-pcall(function()
-	RunService:UnbindFromRenderStep(BIND_NAME)
-end)
-RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 10, onRenderStep)
-
-applyShiftLockState()
